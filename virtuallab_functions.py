@@ -1,0 +1,285 @@
+# Se deben codificar las siguientes funciones y replicar la funcionalidad descrita en los comentarios
+# Además, para la gestión de usuarios y prácticas de laboratorio se debe hacer uso de archivos de texto no se permite
+# el uso de motores de bases de datos
+
+
+import os #Sirve para trabajar con archivos y carpetas
+from json import dumps # Convertir diccionario a JSON
+from json import loads # Convertir JSON a diccionario
+
+usersFile = "server/users.txt" #Guarda a todos los usuarios que se han registrado
+sessionsFile = "server/sessions.txt" #Guarda en un archivo la informacion de las id de cada usuario que inicie sesion y tengan sesion abierta
+assignmentsFile = "server/assignments.txt"  #Se utiliza para guardar las asignaciones de los laboratorios a los estudiantes
+
+
+def writeUserDataToFile(user_data): #se crea la funcion para registar cada usuario que ingresa y lo guarda en un diccionario
+    with open(usersFile, "a") as file: #abre el archivo donde se guarda a los usuarios en modo de ir agregando a lo ultimo y ir guardando y si no existe lo crea el archivo
+        file.write(dumps(user_data) + "\n") #Convierte el diccionario a texto formato JSON con dumps y se utiliza \n para agregar un salto de linea al final
+
+# Función para registrar un usuario con nombre name, identificador id, rol role y contraseña password.
+# Registra el usuario en el sistema si el id del usuario no existe previamente. Si el usuario se pudo registrar debe retornar "User {name} with role {role} registered" de lo contrario
+# debe retornar "User already registered"
+def registerUser(name,id,role,password): # se crea la funcion paras registrar a los usuarios
+    
+    try:  #Se utiliza por si ocurre el error indicado no se pare el programa si no que salte el error y el programa siga
+        file=open(usersFile, "r") #Se pide que abra el archivo donde se registran los usuarios en modo de solo lectura      
+
+    except FileNotFoundError: #Se ingresa al except si no se encuentra el archivo osea si no existe
+    
+        print("File not found, creating a new one.") #Le dice al usuario que no se encontro el archivo
+         
+                      
+    else: #se utiliza la condicional para que se salga si encuentra el archivo
+        with file:  #se utiliza para abrir el archivo y  que se cierre el archivo al final del programa
+            lines=file.readlines() #se crea la variable lines para que guarde la informacion del archivo y con readlines se convierta en lista de lineas con su salto de liena
+            for line in lines: #se pide que revise linea por linea del archivo
+                user=loads(line) #Convierte cada linea de texto revisada en un diccionario
+                if user["id"]==id: #Se utiliza el condicional para pregunjtar si el id qeu se tiene guardado es igual al que se va a registrar
+                    response="User already registered" #se crea la variable con el mensaje que ya esta registrado
+                    print(response) #imprime el mensaje anterior
+                    return response #DEvuelve el mensaje
+
+    
+    #######################################
+    user_data = {  
+        "name": name,
+        "id": id,          #se crea la variable de diccionario en donde se guarda la informacion 
+        "role": role,
+        "password": password
+    }
+
+    writeUserDataToFile(user_data) #llama a la funcion de arriba para guardar la informacion de usuario
+    response=f"User {name} with role {role} registered"
+    print(response)
+    return response
+            
+
+
+# Función que abre una sesión
+# Abre una sesión del usuario 
+# lo hace si el id del usuario y la contraseña son correctos
+# Si la sesión se pudo abrir debe retornar "Session was succesfully opened" de lo contrario
+# debe retornar "error"
+def openSession(id,password):
+    try:
+        with open(usersFile, "r") as file:
+
+            for line in file:
+                user = loads(line) #Sirve para convertir el archivo con la informacion de los usuarios en diccionario
+
+                if user["id"] == id and user["password"] == password:
+                    with open(sessionsFile, "a") as s_file:
+                        s_file.write(str(id)+ "\n") # se asegura que la id se escriba como texto y le agrega un salto de linea al final de este
+                    return"Session was succesfully opened"
+        return "error"
+    except FileNotFoundError:
+        return "error"
+   
+
+# Función que cierra una sesión
+# Cierra una sesión del usuario
+# Si la sesión se pudo cerrar debe retornar "Session was succesfully closed" de lo contrario
+# debe retornar "error"
+def closeSession(id):
+
+    try:
+        with open (sessionsFile, "r") as file:
+            sesiones = []
+            for line in file:
+                linea_limpia = line.strip() #ayuda a limpiar el archivo de los espacios, tabulaciones y saltos de linea
+                if linea_limpia != str(id): # al eliminar lo anterior se hace la comparativa de id, para comparar, si es diferentes es un usuario que todavia no va a cerrar sesion, si es igual es un usuario que va a cerrar sesion
+                    sesiones.append(linea_limpia) #Se guarda en la lista los usuarios que todavia no van a cerrar sesion
+
+        with open (sessionsFile, "w") as s_file:
+            for i in sesiones: #se crea el ciclo para que recorra el archivo de sessiones
+                s_file.write(i + "\n") #escribe la id como texto y al final hace un sato de linea para gregar mas ids
+
+        return "Session was succesfully closed" #Retorna el mensaje que sde pudo cerrar sesion correctamente
+    except FileNotFoundError:  # el except del try si es por que no encontro el archivo de sessionsfile
+        return "error"  #Devuelve el mensaje error si no encuentra el archivo
+
+
+# Función para recibir una práctica de laboratorio (archivo zip) de un profesor
+# Recibe una práctica de laboratorio si el usuario es un profesor y se encuentra con sesión abierta
+# Si se recibe el archivo correctamente se debe retornar  "File was succesfully received" de lo contrario
+# debe retornar "error"
+# Se proporciona un código de ejemplo pero se deben implementar las validaciones de usuario y de sesión abierta
+def uploadLab(id,file_name,file_data):
+   isprofessor = False
+   if os.path.exists(usersFile):
+       with open(usersFile, "r") as file:
+           for line in file:
+               if line.strip() != "": #se utiliza para limpiar el texto de saltos de textos, espacios vacios, ya despues pregunta si en el texto qeudaron "" vacios y si es asi da error
+                   user = loads(line) #se utiliza para convertir el archivo JSON en un diccionario para poder utilizar su informacion
+                   if str(user["id"]) == str(id) and user["role"] == "professor":
+                       isprofessor = True
+   sessions = []
+   if os.path.exists(sessionsFile):
+       with open(sessionsFile, "r") as file:
+           sessions = file.read().split()
+   if not isprofessor or str(id) not in sessions: #verifica si es un  profesor y  la id que tiene este con la sesion abierta
+       print("error")
+       return "error"
+   upload_dir = "server/labs" #se crea la variable en donde se guardara los laboratorios
+   os.makedirs(upload_dir, exist_ok=True) # se utiliza el modulo os para crear una carpeta para los laboratorios llamada upload_dir, se utiliza el exist p-ara ccomprar si no existe ya una carpeta con este nombre
+
+   target_path = os.path.join(upload_dir, file_name) #se crea la variable en donde se une la carpeta creada antes con el nombre del laboratorio y con esto guardara la ruta
+   with open(target_path, "wb") as f: # se abre el archivo en modo escritura binaria, que seria w de escritura y b de binario
+       f.write(file_data) #se escribe en bytes la informacion del zip del cliente, osea el laboratorio
+   response = "File was succesfully received"
+   print(response)
+   return response
+
+       
+# Función para enviar una práctica de laboratorio (archivo zip) a un estudiante
+# Envía una práctica de laboratorio si el usuario es un estudiante, se encuentra con sesión abierta
+# y la práctica de laboratorio está asignada a él.
+# Si el archivo no existe debe retornar "error"
+# Se proporciona un código de ejemplo pero se deben implementar las validaciones de usuario, sesión abierta y asignación de la práctica de laboratorio
+def downloadLab(id,file_name):
+    response = "error"
+    isStudent = False
+    if os.path.exists(usersFile):
+        with open(usersFile, "r") as file:
+            for line in file:
+                if line.strip() != "":
+                    user = loads(line)
+                    if str(user["id"]) == str(id) and user["role"] == "student":
+                        isStudent = True
+    sessions = []
+    if os.path.exists(sessionsFile):
+        with open(sessionsFile, "r") as file:
+            sessions = file.read().split()
+    lab_name = file_name.replace(".zip", "")
+    isAssigned = False
+    if os.path.exists(assignmentsFile):
+        with open(assignmentsFile, "r") as file:
+            for line in file:
+                if line.strip() != "":
+                    assignment = loads(line)
+                    if str(assignment["student_id"]) == str(id) and assignment["lab_name"] == lab_name:
+                        isAssigned = True
+    if isStudent and str(id) in sessions and isAssigned:
+        file_path = os.path.join("server/labs", lab_name + ".zip")
+        try:
+            with open(file_path, "rb") as f:
+                data = f.read()
+            print(f"downloadLab called by user {id}")
+            return data
+        except FileNotFoundError:
+            pass
+    print (response)
+    return response
+
+# Función para listar las prácticas de laboratorio disponibles para un estudiante
+# Lista las prácticas de laboratorio disponibles para un estudiante si el usuario es un estudiante y se encuentra con sesión abierta
+# Si el usuario no es un estudiante o no tiene sesión abierta debe retornar "error"
+def listStudentLabs(id):
+    response="error"
+    sessions=[]
+    if os.path.exists(sessionsFile):
+        with open(sessionsFile, "r") as file:
+            sessions=file.read().split()
+    isStudent=False
+    if os.path.exists(usersFile):
+        with open(usersFile, "r") as file:
+            for line in file:
+                user=loads(line)
+                if user["id"]==id and user["role"]=="student":
+                    isStudent=True
+    if isStudent and str(id) in sessions:
+        labs=[]
+        if os.path.exists(assignmentsFile):
+            with open(assignmentsFile, "r") as file:
+                for line in file:
+                    assignment=loads(line)
+                    if assignment["student_id"]==id and assignment["lab_name"] not in labs:
+                        labs.append(assignment["lab_name"])
+        response=dumps(labs)
+    print(response)
+    return response
+
+
+# Función para listar las prácticas de laboratorio cargadas por los profesores
+# Lista las prácticas de laboratorio cargadas por los profesores si el usuario es un profesor y se encuentra con sesión abierta
+# Si el usuario no es un profesor o no tiene sesión abierta debe retornar "error"   
+def listProfessorsLabs(id):
+    isProfessor = False
+    if os.path.exists(usersFile):
+        with open(usersFile, "r") as file:
+            for line in file:
+                if line.strip() != "":
+                    user = loads(line)
+                    if str(user["id"]) == str(id) and user["role"] == "professor":
+                        isProfessor = True
+    sessions = []
+    if os.path.exists(sessionsFile):
+        with open(sessionsFile, "r") as file:
+            sessions = file.read().split()
+    if not isProfessor or str(id) not in sessions:
+        print("error")
+        return "error"
+    labs = []
+    if os.path.exists("server/labs"):
+        labs = os.listdir("server/labs")
+    print(labs)
+    return labs
+
+# Función para listar los estudiantes registrados en el sistema
+# Lista los estudiantes registrados en el sistema si el usuario es un profesor y se encuentra con sesión abierta
+# Si el usuario no es un profesor o no tiene sesión abierta debe retornar "error"
+def listStudents(id):
+    try:
+        with open(sessionsFile, "r") as file:
+            sesion_activa = False
+            for line in file:
+                linea_limpia = line.strip()
+                if linea_limpia == str(id):
+                    sesion_activa = True
+                    break
+        with open(usersFile, "r") as file:
+            estudiantes = []
+            es_profesor = False
+            for line in file:
+                user = loads(line)
+                if user ["role"] == "professor" and str(user["id"]) == str(id):
+                    es_profesor = True
+                elif user["role"] == "student":
+                    estudiantes.append(user["name"])
+
+        if not sesion_activa or not es_profesor:
+            return "error"
+        return estudiantes
+
+    except FileNotFoundError:
+        return "error"
+
+# Función para asignar una práctica de laboratorio a un estudiante
+# Asigna una práctica de laboratorio a un estudiante si el usuario es un profesor y se encuentra con sesión abierta
+# Si el usuario no es un profesor o no tiene sesión abierta o el estudiante no existe o la práctica no existe debe retornar "error"
+def assignLab(id,lab_name,student_id): #Creacion de funcion para asignar los laboratorios a los estudiantes, se pide verficar las id tanto del profesor como del estudiantes y el nombre del laboratorio
+    respuesta = "error" #se creas esta variable por si hay alguna falla al verificar las ids o el laboratorio que se quiere asignar se retorne que hubo algun error
+    sesion_profesores = False # Variable que se crea para expresar que no hay ningun inicio se sesion activo del profesor, se inicia en false para decir que no se ha encontrado inicia inicio de sesion de un profesor
+    sesion_estudiantes = False #Esta varibale seria para lo mismo, para inicialisar que no hay ningun inicio de sesion de los estudiantes y ya verificar mas adelante si se inicia sesion con las ids correctas
+    if os.path.exists(usersFile): # Se verifica si existe el archivo de "userfile" que es donde estarian todos los usuarios registrados, si no hay usuarios las variables de arriba seguirian en false y se faltaria el if
+        with open(usersFile, "r") as file: #si existe el archivo se abre y se lee, se utiliza el with open para que se cierre solo al final
+            for line in file: #Se utiliza el ciclo para que vaya leyendo linea por linea el documento de los usuarios registrados
+                usuario = loads(line) #se crea la variable para guardar la informacion de cada usuario en un diccionario, como el nombre, la id y el rol
+                if usuario["id"]==id and usuario["role"]=="professor": #Se utiliza la condicional para verificar si la id y el rol que ingreso sea el mismo que estaba guardado en los usuarios registrados
+                    sesion_profesores=True #Si se cumple la condicion la variable cambia a true
+                if usuario["id"]==student_id and usuario["role"]=="student": #Se utilizaria el mismo condicional para verificar id y rol pero esta vez seria para verificar si es un estudiantes de la clase
+                    sesion_estudiantes=True #Si se cumple la condicion la variable pasa a true
+    sesion=[] #Se crea una lista para que vaya guardando las id de las personas que vayan iniciando sesion y tengan la sesion abierta
+    if os.path.exists(sessionsFile): #Se verifica que exista el documento en donde verifica quen haya usuarios con la sesion abierta
+        with open(sessionsFile, "r") as file: #Si existe el documento se abre en modo lectura y se cierra al final cuando se termine de utilizar
+            sesion=file.read().split() # se utilice el .read para que lea todo el documento de las id y lo vuelve texto, de ahi se utiliza el .split para que este texto se organice en la lista y que cada esapcio o saltos de linea que haya agregue una coma
+    lab_name=lab_name.replace(".zip","") #Se crea la variable para guardar el archivo del laboratorio y adicional verifica si el archivo tiene .zip quita esta extension para que quede como documento txt
+    labExists=os.path.exists(os.path.join("server/labs", lab_name + ".zip")) #Con esto se verifica y se arma la ruta para encontrar el archivo del laboratorio, esto se completa con la funcion de uploadlab que es la que nos ayuda a subir el labotario
+    if sesion_profesores and str(id) in sesion and sesion_estudiantes and labExists: #Se hace la condicional principal para que se pueda asignar el laboratorio, se verifica que quien desea asignar el laboratorio sea un profesor, que tenga la sesion abierta, que el estudiante exista y este en la clase y que el documento del laboratorio tambien exista
+        assignment={"professor_id": id, "student_id": student_id, "lab_name": lab_name} #Crea la variable o registro en donde guarda toda la informacion de la asignacion, lo hace dentro de una biblioteca en donde la inforacion que guarda es el id el profesor que va a asiganr el lab, el id del estudiante al que le van a asignar el lab y el nombre del arcihvo del laboratorio 
+        with open(assignmentsFile, "a") as file:  #Se abre el registro que se tiene para registrar las asignaciones de los lab, en este se hace en modo a que guarda lo que se tiene y se le agrega al final
+            file.write(dumps(assignment) + "\n") #Ya con este registro abierto se le pide que escriba la variable assignment, pero para esto se utiliza el modulo dumps que se importo el cual nos ayuda a convertir la biblioteca en un texto formato JSON lo cual ya quedarian en una variable tipo str y se le agrega \n para que haga un salto de texto al final para separar cada asignacion
+        respuesta=f"Lab {lab_name} assigned to student {student_id}" #Ya al verificar que las ids de el profesor y el estudiante sean correctas y que si halla un laboratorio para asignar en la variable respuesta se cargaria el nombre del laboratorio y al estudiante que se le asigna este, se utiliza la f para elinimar las llaves en el texto y no se retorne con eso y quede mas limpio
+    print(respuesta) #Se imprime en pantalla la variable anterior con la asignacion
+    return respuesta # retorna esta respuesta
+    
