@@ -1,0 +1,867 @@
+"""Pruebas unitarias para virtuallab_interfaz.py (stdlib unittest)."""
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+import types
+import unittest
+import zipfile
+from unittest.mock import patch
+
+# Evita importar el cliente real: las pruebas no requieren requests ni servidor.
+sys.modules["virtuallab_client"] = types.ModuleType("virtuallab_client")
+import virtuallab_interfaz as app  # noqa: E402
+
+
+class FakeTree:
+    def __init__(self):
+        self.rows = []
+
+    def get_children(self):
+        return list(range(len(self.rows)))
+
+    def delete(self, item):
+        self.rows.pop(item)
+
+    def insert(self, parent, index, values):
+        self.rows.append(tuple(values))
+
+
+class TestRoleDetection(unittest.TestCase):
+    def test_detects_professor_role_case_insensitively(self):
+        self.assertEqual(app.VirtualLab.detect_role({"role": "PROFESOR"}), "professor")
+
+    def test_detects_nested_student_role(self):
+        self.assertEqual(app.VirtualLab.detect_role({"user": {"role": "Estudiante"}}), "student")
+
+    def test_unknown_role_returns_none(self):
+        self.assertIsNone(app.VirtualLab.detect_role({"role": "admin"}))
+
+    def test_unstructured_response_returns_none(self):
+        self.assertIsNone(app.VirtualLab.detect_role("student"))
+
+
+class TestLabParsing(unittest.TestCase):
+    def test_empty_or_error_response_returns_empty_list(self):
+        for raw in (None, "", "error"): 
+            with self.subTest(raw=raw):
+                self.assertEqual(app.ProfessorView._parse_labs(raw), [])
+
+    def test_parses_newline_separated_names(self):
+        self.assertEqual(
+            app.ProfessorView._parse_labs("Circuito A.zip\n Circuito B.zip \n"),
+            [("Circuito A.zip", "Cargado"), ("Circuito B.zip", "Cargado")],
+        )
+
+    def test_parses_labs_dictionary_and_date_aliases(self):
+        raw = {"labs": [
+            {"name": "A.zip", "date": "2026-01-02"},
+            {"lab_name": "B.zip", "created_at": "2026-01-03"},
+            {"title": "C.zip"},
+        ]}
+        self.assertEqual(
+            app.ProfessorView._parse_labs(raw),
+            [("A.zip", "2026-01-02"), ("B.zip", "2026-01-03"), ("C.zip", "Cargado")],
+        )
+
+    def test_parses_laboratories_wrapper(self):
+        self.assertEqual(
+            app.ProfessorView._parse_labs({"laboratories": ["A.zip"]}),
+            [("A.zip", "Cargado")],
+        )
+
+    def test_parses_tuple_and_scalar_items(self):
+        self.assertEqual(
+            app.ProfessorView._parse_labs([["A.zip", "Hoy"], ["B.zip"], "C.zip"]),
+            [("A.zip", "Hoy"), ("B.zip", "Cargado"), ("C.zip", "Cargado")],
+        )
+
+
+class TestStudentParsing(unittest.TestCase):
+    def test_empty_or_error_response_returns_empty_list(self):
+        for raw in (None, "", "error"): 
+            with self.subTest(raw=raw):
+                self.assertEqual(app.ProfessorView._parse_students(raw), [])
+
+    def test_parses_csv_like_response_and_roles(self):
+        self.assertEqual(
+            app.ProfessorView._parse_students("101, Ana, professor\n102, Luis"),
+            [("101", "Ana", "Sin clase", "Profesor"), ("102", "Luis", "Sin clase", "Estudiante")],
+        )
+
+    def test_parses_student_dictionary_aliases(self):
+        raw = {"students": [
+            {"id": 101, "name": "Ana", "role": "professor"},
+            {"user_id": 102, "username": "Luis"},
+        ]}
+        self.assertEqual(
+            app.ProfessorView._parse_students(raw),
+            [("101", "Ana", "Sin clase", "Profesor"), ("102", "Luis", "Sin clase", "Estudiante")],
+        )
+
+    def test_parses_users_wrapper(self):
+        self.assertEqual(
+            app.ProfessorView._parse_students({"users": [[7, "Mara", "profesor"]]}),
+            [("7", "Mara", "Sin clase", "Profesor")],
+        )
+
+    def test_parses_tuple_and_scalar_items(self):
+        self.assertEqual(
+            app.ProfessorView._parse_students([[3, "Sol", "student"], [4, "Paz"], "5"]),
+            [("3", "Sol", "Sin clase", "Estudiante"), ("4", "Paz", "Sin clase", "Estudiante"), ("5", "Estudiante", "Sin clase", "Estudiante")],
+        )
+
+
+class TestLatestResponseFormats(unittest.TestCase):
+    def test_parses_json_encoded_labs(self):
+        raw = '{"labs": [{"name": "Circuito.zip", "created_at": "hoy"}]}'
+        self.assertEqual(
+            app.ProfessorView._parse_labs(raw),
+            [("Circuito.zip", "hoy")],
+        )
+
+    def test_parses_python_literal_lab_response(self):
+        raw = "[('Circuito A.zip', 'Hoy'), 'Circuito B.zip']"
+        self.assertEqual(
+            app.ProfessorView._parse_labs(raw),
+            [("Circuito A.zip", "Hoy"), ("Circuito B.zip", "Cargado")],
+        )
+
+    def test_lab_error_status_returns_no_labs(self):
+        raw = {"status": "error", "labs": [{"name": "no-debe-aparecer.zip"}]}
+        self.assertEqual(app.ProfessorView._parse_labs(raw), [])
+
+    def test_parses_json_student_aliases_with_class_and_role(self):
+        raw = '{"data": [{"student_id": 44, "nombre": "Ana", "clase": "Física", "rol": "profesor"}]}'
+        self.assertEqual(
+            app.ProfessorView._parse_students(raw),
+            [("44", "Ana", "Física", "Profesor")],
+        )
+
+    def test_parses_python_literal_student_with_name_before_id(self):
+        raw = '[("Luis", 45, "student")]'
+        self.assertEqual(
+            app.ProfessorView._parse_students(raw),
+            [("45", "Luis", "Sin clase", "Estudiante")],
+        )
+
+    def test_parses_mapping_of_ids_to_student_records(self):
+        raw = {"users": {"51": {"full_name": "Mara", "class": "Química", "role": "student"}}}
+        self.assertEqual(
+            app.ProfessorView._parse_students(raw),
+            [("51", "Mara", "Química", "Estudiante")],
+        )
+
+    def test_parses_name_only_student_entries(self):
+        self.assertEqual(
+            app.ProfessorView._parse_students(["Helena"]),
+            [("-", "Helena", "Sin clase", "Estudiante")],
+        )
+
+    def test_student_error_status_returns_empty_list(self):
+        raw = {"status": "Error 404", "items": [{"id": 9, "name": "No debe aparecer"}]}
+        self.assertEqual(app.ProfessorView._parse_students(raw), [])
+
+
+class TestClientCompatibilityAdapters(unittest.TestCase):
+    def setUp(self):
+        self.fake_app = types.SimpleNamespace(app=types.SimpleNamespace(user_id=77))
+        self.temp_folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_folder.cleanup)
+        self.source_zip = Path(self.temp_folder.name) / "source.zip"
+        with zipfile.ZipFile(self.source_zip, "w") as archive:
+            archive.writestr("circuito.cir", "Circuito\n.end\n")
+
+    def test_list_students_supports_url_and_user_id(self):
+        calls = []
+        def list_students(url, uid):
+            calls.append((url, uid))
+            return ["student"]
+        with patch.object(app, "client", types.SimpleNamespace(listStudents=list_students)):
+            result = app.ProfessorView._api_list_students(self.fake_app, 12)
+        self.assertEqual(result, ["student"])
+        self.assertEqual(calls, [(app.URL, 12)])
+
+    def test_list_students_supports_url_only_signature(self):
+        calls = []
+        def list_students(url):
+            calls.append((url,))
+            return []
+        with patch.object(app, "client", types.SimpleNamespace(listStudents=list_students)):
+            app.ProfessorView._api_list_students(self.fake_app)
+        self.assertEqual(calls, [(app.URL,)])
+
+    def test_list_students_without_client_method_returns_empty_list(self):
+        with patch.object(app, "client", types.SimpleNamespace()):
+            self.assertEqual(app.ProfessorView._api_list_students(self.fake_app), [])
+
+    def test_upload_lab_supports_four_argument_signature(self):
+        calls = []
+        def upload(url, uid, name, path):
+            calls.append((url, uid, name, zipfile.is_zipfile(path)))
+            return "ok"
+        with patch.object(app, "client", types.SimpleNamespace(uploadLab=upload)):
+            result = app.ProfessorView._api_upload_lab(self.fake_app, "A.zip", str(self.source_zip))
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls, [(app.URL, 77, "A.zip", True)])
+
+    def test_upload_lab_supports_legacy_three_argument_signature(self):
+        calls = []
+        def upload(url, uid, path):
+            calls.append((url, uid, zipfile.is_zipfile(path)))
+            return "ok"
+        with patch.object(app, "client", types.SimpleNamespace(uploadLab=upload)):
+            app.ProfessorView._api_upload_lab(self.fake_app, "A.zip", str(self.source_zip))
+        self.assertEqual(calls, [(app.URL, 77, True)])
+
+    def test_upload_lab_supports_file_before_name_signature(self):
+        calls = []
+        def upload(url, uid, file_path, lab_name):
+            calls.append((url, uid, zipfile.is_zipfile(file_path), lab_name))
+            return "ok"
+        with patch.object(app, "client", types.SimpleNamespace(uploadLab=upload)):
+            result = app.ProfessorView._api_upload_lab(self.fake_app, "A.zip", str(self.source_zip))
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls, [(app.URL, 77, True, "A.zip")])
+
+    def test_assign_lab_places_lab_before_student_when_signature_says_so(self):
+        calls = []
+        def assign(url, uid, lab_name, student_id):
+            calls.append((url, uid, lab_name, student_id))
+        with patch.object(app, "client", types.SimpleNamespace(assignLab=assign)):
+            app.ProfessorView._api_assign_lab(self.fake_app, 12, "A.zip")
+        self.assertEqual(calls, [(app.URL, 77, "A.zip", 12)])
+
+    def test_assign_lab_places_student_before_lab_when_signature_says_so(self):
+        calls = []
+        def assign(url, uid, student_id, lab_name):
+            calls.append((url, uid, student_id, lab_name))
+        with patch.object(app, "client", types.SimpleNamespace(assignLab=assign)):
+            app.ProfessorView._api_assign_lab(self.fake_app, 12, "A.zip")
+        self.assertEqual(calls, [(app.URL, 77, 12, "A.zip")])
+
+    def test_assign_lab_supports_three_argument_legacy_signature(self):
+        calls = []
+        def assign(url, lab_name, student_id):
+            calls.append((url, lab_name, student_id))
+        with patch.object(app, "client", types.SimpleNamespace(assignLab=assign)):
+            app.ProfessorView._api_assign_lab(self.fake_app, 12, "A.zip")
+        self.assertEqual(calls, [(app.URL, "A.zip", 12)])
+
+
+class TestLocalRoster(unittest.TestCase):
+    def make_context(self, path, user_id=77):
+        context = app.ProfessorView.__new__(app.ProfessorView)
+        context.app = types.SimpleNamespace(user_id=user_id)
+        context._ProfessorView__prof_users = [("old", "Old", "Old class", "Estudiante")]
+        context._ProfessorView__prof_classes = ["Old class"]
+        context._ProfessorView__removed_students = {"old"}
+        context._roster_file = lambda: str(path)
+        return context
+
+    def test_missing_roster_resets_local_state(self):
+        with tempfile.TemporaryDirectory() as folder:
+            context = self.make_context(Path(folder) / "missing.json")
+            app.ProfessorView._load_local_roster(context)
+        self.assertEqual(context.prof_users, [])
+        self.assertEqual(context.prof_classes, ["Sin clase"])
+        self.assertEqual(context._ProfessorView__removed_students, set())
+
+    def test_loads_classes_and_legacy_user_rows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "roster.json"
+            path.write_text(json.dumps({
+                "classes": [" Física ", "", "Física"],
+                "users": [
+                    ["7", "Ana", "Física", "Estudiante"],
+                    ["8", "Luis", "Profesor"],
+                    ["malformado"],
+                ],
+                "removed": ["9", "ana"],
+            }), encoding="utf-8")
+            context = self.make_context(path)
+            app.ProfessorView._load_local_roster(context)
+        self.assertEqual(context.prof_classes, ["Sin clase", "Física"])
+        self.assertEqual(context.prof_users, [
+            ("7", "Ana", "Física", "Estudiante"),
+            ("8", "Luis", "Sin clase", "Profesor"),
+        ])
+        self.assertEqual(context._ProfessorView__removed_students, {"9", "ana"})
+
+    def test_corrupt_roster_resets_state_without_raising(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "roster.json"
+            path.write_text("{no es json", encoding="utf-8")
+            context = self.make_context(path)
+            app.ProfessorView._load_local_roster(context)
+        self.assertEqual(context.prof_users, [])
+        self.assertEqual(context.prof_classes, ["Sin clase"])
+        self.assertEqual(context._ProfessorView__removed_students, set())
+
+    def test_save_and_reload_preserves_classes_users_and_removals(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "roster.json"
+            saved = app.ProfessorView.__new__(app.ProfessorView)
+            saved.app = types.SimpleNamespace(user_id=77)
+            saved._ProfessorView__prof_classes = ["Sin clase", "Electrónica"]
+            saved._ProfessorView__prof_users = [("23", "Ángela", "Electrónica", "Estudiante")]
+            saved._ProfessorView__removed_students = {"11"}
+            saved._roster_file = lambda: str(path)
+            app.ProfessorView._save_local_roster(saved)
+            loaded = self.make_context(path)
+            app.ProfessorView._load_local_roster(loaded)
+        self.assertEqual(loaded.prof_classes, ["Sin clase", "Electrónica"])
+        self.assertEqual(loaded.prof_users, [("23", "Ángela", "Electrónica", "Estudiante")])
+        self.assertEqual(loaded._ProfessorView__removed_students, {"11"})
+
+    def test_save_skips_when_professor_id_is_missing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "should-not-exist.json"
+            context = types.SimpleNamespace(
+                app=types.SimpleNamespace(user_id=None),
+                _roster_file=lambda: self.fail("No debe calcular la ruta sin ID"),
+            )
+            app.ProfessorView._save_local_roster(context)
+            self.assertFalse(path.exists())
+
+
+class TestStudentVerification(unittest.TestCase):
+    def make_context(self, server_response, local_users=None, teacher_id=900):
+        context = app.ProfessorView.__new__(app.ProfessorView)
+        context.app = types.SimpleNamespace(user_id=teacher_id)
+        context._ProfessorView__prof_users = local_users or []
+        context._api_list_students = lambda uid: server_response
+        return context
+
+    def test_rejects_professors_own_id_without_server_call(self):
+        calls = []
+        context = self.make_context(None)
+        context._api_list_students = lambda uid: calls.append(uid)
+        valid, message = app.ProfessorView._verify_student_exists(context, 900, "Ana")
+        self.assertFalse(valid)
+        self.assertIn("pertenece a tu cuenta", message)
+        self.assertEqual(calls, [])
+
+    def test_rejects_local_id_already_assigned_to_another_name(self):
+        calls = []
+        context = self.make_context(None, [("123", "Ana", "Física", "Estudiante")])
+        context._api_list_students = lambda uid: calls.append(uid)
+        valid, message = app.ProfessorView._verify_student_exists(context, 123, "Luis")
+        self.assertFalse(valid)
+        self.assertIn("ya está asignado", message)
+        self.assertEqual(calls, [])
+
+    def test_accepts_matching_server_id_and_name(self):
+        context = self.make_context({"students": [{"id": 123, "name": "Ana"}]})
+        self.assertEqual(app.ProfessorView._verify_student_exists(context, 123, " Ana "), (True, "OK"))
+
+    def test_rejects_id_not_registered_on_server(self):
+        context = self.make_context({"students": [{"id": 123, "name": "Ana"}]})
+        valid, message = app.ProfessorView._verify_student_exists(context, 124, "Luis")
+        self.assertFalse(valid)
+        self.assertIn("no existe", message)
+
+    def test_rejects_name_that_does_not_match_server_id(self):
+        context = self.make_context({"students": [{"id": 123, "name": "Ana"}]})
+        valid, message = app.ProfessorView._verify_student_exists(context, 123, "Luis")
+        self.assertFalse(valid)
+        self.assertIn("pertenece a 'Ana'", message)
+
+    def test_accepts_matching_name_when_server_has_no_ids(self):
+        context = self.make_context(["Ana", "Luis"])
+        self.assertEqual(app.ProfessorView._verify_student_exists(context, 123, "ana"), (True, "OK"))
+
+    def test_rejects_unregistered_name_when_server_has_no_ids(self):
+        context = self.make_context(["Ana", "Luis"])
+        valid, message = app.ProfessorView._verify_student_exists(context, 123, "Mara")
+        self.assertFalse(valid)
+        self.assertIn("no está registrado", message)
+
+    def test_empty_server_list_allows_local_fallback(self):
+        self.assertEqual(
+            app.ProfessorView._verify_student_exists(self.make_context([]), 123, "Mara"),
+            (True, "OK"),
+        )
+
+
+class TestServerStudentMerge(unittest.TestCase):
+    def make_context(self, local_users, removed=None):
+        saves = []
+        context = app.ProfessorView.__new__(app.ProfessorView)
+        context._ProfessorView__prof_users = list(local_users)
+        context._ProfessorView__removed_students = set(removed or [])
+        context._save_local_roster = lambda: saves.append(True)
+        return context, saves
+
+    def test_restores_saved_id_class_and_role_for_server_name_only_record(self):
+        context, saves = self.make_context([
+            ("101", "Ana", "Física", "Profesor"),
+        ])
+        app.ProfessorView._merge_server_students(context, [
+            ("-", "Ana", "Sin clase", "Estudiante"),
+        ])
+        self.assertEqual(context.prof_users, [("101", "Ana", "Física", "Profesor")])
+        self.assertEqual(saves, [True])
+
+    def test_preserves_local_class_for_matching_server_student(self):
+        context, _ = self.make_context([
+            ("101", "Ana", "Física", "Estudiante"),
+        ])
+        app.ProfessorView._merge_server_students(context, [
+            ("101", "Ana", "Sin clase", "Estudiante"),
+        ])
+        self.assertEqual(context.prof_users, [("101", "Ana", "Física", "Estudiante")])
+
+    def test_omits_students_removed_by_id_or_name(self):
+        local = [
+            ("10", "Ana", "A", "Estudiante"),
+            ("11", "Luis", "B", "Estudiante"),
+        ]
+        context, _ = self.make_context(local, removed={"10", "luis"})
+        app.ProfessorView._merge_server_students(context, [
+            ("10", "Ana", "Sin clase", "Estudiante"),
+            ("11", "Luis", "Sin clase", "Estudiante"),
+            ("12", "Mara", "Sin clase", "Estudiante"),
+        ])
+        self.assertEqual(context.prof_users, [("12", "Mara", "Sin clase", "Estudiante")])
+
+    def test_keeps_manually_added_student_missing_from_server(self):
+        context, _ = self.make_context([
+            ("88", "Local", "Clase A", "Estudiante"),
+        ])
+        app.ProfessorView._merge_server_students(context, [
+            ("99", "Servidor", "Clase B", "Estudiante"),
+        ])
+        self.assertEqual(context.prof_users, [
+            ("99", "Servidor", "Clase B", "Estudiante"),
+            ("88", "Local", "Clase A", "Estudiante"),
+        ])
+
+
+class TestAsyncErrorCallbacks(unittest.TestCase):
+    class ImmediateThread:
+        def __init__(self, target, daemon=True):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    def queue_failing_task_callback(self, on_error):
+        callbacks = []
+        fake_app = types.SimpleNamespace(
+            winfo_exists=lambda: True,
+            after=lambda delay, callback: callbacks.append(callback),
+        )
+
+        def fail():
+            raise RuntimeError("servidor no disponible")
+
+        with patch.object(app.threading, "Thread", self.ImmediateThread):
+            app.VirtualLab._run_async(fake_app, fail, lambda result: None, on_error)
+        self.assertEqual(len(callbacks), 1)
+        return callbacks[0]
+
+    def test_error_callback_keeps_exception_after_worker_finishes(self):
+        errors = []
+        callback = self.queue_failing_task_callback(errors.append)
+        callback()
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], RuntimeError)
+        self.assertEqual(str(errors[0]), "servidor no disponible")
+
+    def test_default_error_dialog_keeps_exception_after_worker_finishes(self):
+        callback = self.queue_failing_task_callback(None)
+        with patch.object(app.messagebox, "showerror") as showerror:
+            callback()
+        showerror.assert_called_once_with("Error de conexión", "servidor no disponible")
+
+
+class TestSafeCall(unittest.TestCase):
+    def test_returns_result_and_shows_success_message(self):
+        with patch.object(app.messagebox, "showinfo") as showinfo:
+            result = app.VirtualLab.safe_call(object(), "Descarga", lambda x: x.upper(), "ok")
+        self.assertEqual(result, "OK")
+        showinfo.assert_called_once_with("Descarga", "OK")
+
+    def test_catches_exception_shows_error_and_returns_none(self):
+        def fail():
+            raise RuntimeError("sin conexión")
+        with patch.object(app.messagebox, "showerror") as showerror:
+            result = app.VirtualLab.safe_call(object(), "Descarga", fail)
+        self.assertIsNone(result)
+        showerror.assert_called_once_with("Error", "Descarga\n\nsin conexión")
+
+
+class TestStudentLabTable(unittest.TestCase):
+    def test_populates_rows_from_json_and_marks_local_file(self):
+        tree = FakeTree()
+        fake_app = app.StudentView.__new__(app.StudentView)
+        fake_app._StudentView__labs_tree = tree
+        raw = json.dumps([
+            {"lab_name": "A.zip", "professor_id": 5},
+            {"lab_name": "B.zip", "professor_id": 6},
+        ])
+        def exists(path):
+            return path.endswith("A.zip")
+        with patch.object(app.os.path, "exists", side_effect=exists), \
+                patch.object(app.zipfile, "is_zipfile", side_effect=lambda path: path.endswith("A.zip")):
+            app.StudentView._populate_student_labs(fake_app, raw)
+        self.assertEqual(tree.rows, [
+            ("A.zip", 5, "Descargado"),
+            ("B.zip", 6, "Disponible en servidor"),
+        ])
+
+    def test_error_response_clears_table_without_inserting_rows(self):
+        tree = FakeTree()
+        tree.rows = [("old.zip", 1, "Disponible en servidor")]
+        fake_app = app.StudentView.__new__(app.StudentView)
+        fake_app._StudentView__labs_tree = tree
+        app.StudentView._populate_student_labs(fake_app, "error")
+        self.assertEqual(tree.rows, [])
+
+
+class TestServerConfiguration(unittest.TestCase):
+    def setUp(self):
+        self.fake_app = app.VirtualLab.__new__(app.VirtualLab)
+        self.temp_folder = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_folder.cleanup)
+        self.old_cwd = os.getcwd()
+        os.chdir(self.temp_folder.name)
+        self.addCleanup(os.chdir, self.old_cwd)
+        self.config = Path(self.temp_folder.name) / "client" / "server_config.json"
+        self.config.parent.mkdir()
+        self.config_patch = patch.object(app, "SERVER_CONFIG_FILE", str(self.config))
+        self.config_patch.start()
+        self.addCleanup(self.config_patch.stop)
+
+    def test_adds_protocol_and_default_port_to_bare_host(self):
+        with patch.object(app, "URL", "http://old"):
+            result = app.VirtualLab._apply_server_url(self.fake_app, "  192.168.1.25/  ")
+        self.assertEqual(result, "http://192.168.1.25:80")
+
+    def test_keeps_explicit_https_port_and_path(self):
+        with patch.object(app, "URL", "http://old"):
+            result = app.VirtualLab._apply_server_url(self.fake_app, " https://lab.example:8443/api/ ")
+        self.assertEqual(result, "https://lab.example:8443/api")
+
+    def test_empty_value_uses_localhost_and_writes_config(self):
+        with patch.object(app, "URL", "http://old"):
+            result = app.VirtualLab._apply_server_url(self.fake_app, "  ")
+        self.assertEqual(result, "http://127.0.0.1:80")
+        self.assertEqual(json.loads(self.config.read_text(encoding="utf-8")), {"url": result})
+
+    def test_loads_saved_server_url(self):
+        self.config.write_text(json.dumps({"url": "http://10.0.0.8:8080"}), encoding="utf-8")
+        with patch.object(app, "URL", "http://default"):
+            app.VirtualLab._load_saved_url(self.fake_app)
+            self.assertEqual(app.URL, "http://10.0.0.8:8080")
+
+    def test_ignores_invalid_saved_config(self):
+        self.config.write_text("{no json", encoding="utf-8")
+        with patch.object(app, "URL", "http://default"):
+            app.VirtualLab._load_saved_url(self.fake_app)
+            self.assertEqual(app.URL, "http://default")
+
+
+class TestIdValidationAndSession(unittest.TestCase):
+    def test_id_validator_accepts_empty_and_up_to_ten_digits(self):
+        for value in ("", "0", "1234567890"):
+            with self.subTest(value=value):
+                self.assertTrue(app.VirtualLab._validate_id_input(value))
+
+    def test_id_validator_rejects_letters_mixed_text_and_eleven_digits(self):
+        for value in ("abc", "12a3", "12345678901", " 123"):
+            with self.subTest(value=value):
+                self.assertFalse(app.VirtualLab._validate_id_input(value))
+
+    def test_set_session_updates_read_only_session_properties(self):
+        fake_app = app.VirtualLab.__new__(app.VirtualLab)
+        app.VirtualLab.set_session(fake_app, 42, "student", {"token": "x"})
+        self.assertEqual(fake_app.user_id, 42)
+        self.assertEqual(fake_app.role, "student")
+        self.assertTrue(fake_app.session_active)
+
+
+class TestSpiceNetlist(unittest.TestCase):
+    def make_student(self):
+        return app.StudentView.__new__(app.StudentView)
+
+    def test_parses_supported_components_and_preserves_extra_parameters(self):
+        lines = [
+            "Title", "* comment", ".op", "R1 in out 10k temp=25",
+            "V1 out 0 5", "C1 out 0 10u IC=0", "L1 out gnd 2m",
+            "D1 out n2 Dmodel area=2", "Q1 a b c model", "R2 too-short",
+        ]
+        actual = app.StudentView._parse_spice_components(self.make_student(), lines)
+        self.assertEqual([item["type"] for item in actual], ["R", "V", "C", "L", "D"])
+        self.assertEqual(actual[0]["extra"], "temp=25")
+        self.assertEqual(actual[-1]["value"], "Dmodel")
+        self.assertEqual(actual[-1]["extra"], "area=2")
+        self.assertEqual(actual[0]["line_idx"], 3)
+
+    def test_parser_returns_empty_for_comments_directives_and_incomplete_lines(self):
+        actual = app.StudentView._parse_spice_components(
+            self.make_student(), ["", "* comment", ".tran 1u 5m", "+ continuation", "R1 n1"]
+        )
+        self.assertEqual(actual, [])
+
+    def test_node_voltage_lookup_ignores_case_and_whitespace(self):
+        student = self.make_student()
+        student._StudentView__node_voltages = {" Out ": 3.3, "in": 1.2}
+        self.assertEqual(app.StudentView._lookup_node_voltage(student, "out"), 3.3)
+        self.assertEqual(app.StudentView._lookup_node_voltage(student, " IN "), 1.2)
+
+    def test_node_voltage_lookup_returns_none_for_missing_node(self):
+        student = self.make_student()
+        student._StudentView__node_voltages = {"out": 3.3}
+        self.assertIsNone(app.StudentView._lookup_node_voltage(student, "missing"))
+
+
+class TestSpiceSimulation(unittest.TestCase):
+    def make_student(self, lines=None):
+        student = app.StudentView.__new__(app.StudentView)
+        student._StudentView__current_netlist_lines = (
+            lines if lines is not None else ["Circuito", ".end"]
+        )
+        student._StudentView__node_voltages = {}
+        student.console = []
+        student.write_console = lambda text, clear=False: student.console.append((text, clear))
+        student.draw_count = 0
+        student._draw_circuit_schematic = lambda: setattr(student, "draw_count", student.draw_count + 1)
+        return student
+
+    def fake_pyspice(self, parser):
+        root = types.ModuleType("PySpice")
+        root.__path__ = []
+        spice = types.ModuleType("PySpice.Spice")
+        spice.__path__ = []
+        parser_module = types.ModuleType("PySpice.Spice.Parser")
+        parser_module.SpiceParser = parser
+        return {"PySpice": root, "PySpice.Spice": spice, "PySpice.Spice.Parser": parser_module}
+
+    def test_simulation_stores_operating_point_voltages_and_redraws(self):
+        circuit = types.SimpleNamespace(
+            title="Circuito", simulator=lambda **kwargs: types.SimpleNamespace(
+                operating_point=lambda: types.SimpleNamespace(nodes={"out": [5.0], "0": [0.0]})
+            )
+        )
+        parser = lambda **kwargs: types.SimpleNamespace(build_circuit=lambda: circuit)
+        student = self.make_student()
+        with patch.dict(sys.modules, self.fake_pyspice(parser)):
+            app.StudentView._execute_loaded_netlist(student, "prueba.zip")
+        self.assertEqual(student._StudentView__node_voltages, {"out": 5.0, "0": 0.0})
+        self.assertEqual(student.draw_count, 1)
+        self.assertTrue(any("Simulación completada" in row[0] for row in student.console))
+
+    def test_simulation_uses_ngspice_output_when_operating_point_fails(self):
+        commands = []
+        ngspice = types.SimpleNamespace(
+            clear_output=lambda: None,
+            exec_command=commands.append,
+            stdout="v(out) = 1.25\nv(in) = 2.5\ni1#branch = 0.1\n",
+            stderr="",
+        )
+        simulator = types.SimpleNamespace(
+            operating_point=lambda: (_ for _ in ()).throw(RuntimeError("wrapper error")),
+            ngspice=ngspice,
+        )
+        circuit = types.SimpleNamespace(title="Circuito", simulator=lambda **kwargs: simulator)
+        parser = lambda **kwargs: types.SimpleNamespace(build_circuit=lambda: circuit)
+        student = self.make_student()
+        with patch.dict(sys.modules, self.fake_pyspice(parser)):
+            app.StudentView._execute_loaded_netlist(student, "prueba.zip")
+        self.assertEqual(student._StudentView__node_voltages, {"out": 1.25, "in": 2.5})
+        self.assertEqual(commands, ["op", "print all"])
+
+    def test_simulation_reports_parser_errors_without_raising(self):
+        parser = lambda **kwargs: types.SimpleNamespace(
+            build_circuit=lambda: (_ for _ in ()).throw(ValueError("netlist inválido"))
+        )
+        student = self.make_student()
+        with patch.dict(sys.modules, self.fake_pyspice(parser)), \
+                patch.object(app.messagebox, "showerror") as showerror:
+            app.StudentView._execute_loaded_netlist(student, "prueba.zip")
+        showerror.assert_called_once()
+        self.assertTrue(any("netlist inválido" in row[0] for row in student.console))
+
+    def test_simulation_does_nothing_when_no_netlist_is_loaded(self):
+        student = self.make_student([])
+        with patch.object(app.messagebox, "showerror") as showerror:
+            app.StudentView._execute_loaded_netlist(student, "vacío")
+        showerror.assert_not_called()
+        self.assertEqual(student.console, [])
+
+    def test_zip_simulation_extracts_cir_and_parses_components(self):
+        with tempfile.TemporaryDirectory() as folder:
+            old_cwd = os.getcwd()
+            os.chdir(folder)
+            try:
+                with zipfile.ZipFile("practica.zip", "w") as archive:
+                    archive.writestr("sub/circuito.cir", "* Demo\nR1 in 0 1k\n.end\n")
+                student = self.make_student([])
+                student._StudentView__sim_lab_name = types.SimpleNamespace(get=lambda: "practica")
+                student._refresh_components_table = lambda: None
+                simulated = []
+                student._execute_loaded_netlist = lambda source_label="": simulated.append(source_label)
+                app.StudentView.run_simulation(student)
+                self.assertEqual(simulated, ["practica.zip"])
+                self.assertEqual(student._StudentView__parsed_components[0]["name"], "R1")
+                self.assertTrue(Path(student._StudentView__current_cir_path).is_file())
+            finally:
+                os.chdir(old_cwd)
+
+    def test_zip_without_cir_shows_invalid_practice_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            old_cwd = os.getcwd()
+            os.chdir(folder)
+            try:
+                with zipfile.ZipFile("practica.zip", "w") as archive:
+                    archive.writestr("readme.txt", "no hay netlist")
+                student = self.make_student([])
+                student._StudentView__sim_lab_name = types.SimpleNamespace(get=lambda: "practica.zip")
+                with patch.object(app.messagebox, "showerror") as showerror:
+                    app.StudentView.run_simulation(student)
+                self.assertIn("ZIP no contiene", showerror.call_args.args[1])
+            finally:
+                os.chdir(old_cwd)
+
+
+class TestComponentEditing(unittest.TestCase):
+    def make_student(self):
+        student = app.StudentView.__new__(app.StudentView)
+        student._StudentView__parsed_components = [{
+            "line_idx": 1, "name": "R1", "type": "R", "n1": "in", "n2": "0",
+            "value": "1k", "extra": "temp=25",
+        }]
+        student._StudentView__current_netlist_lines = ["Circuito", "R1 in 0 1k temp=25"]
+        student._StudentView__current_cir_path = "/tmp/circuito.cir"
+        student._refresh_components_table = lambda: setattr(student, "refreshed", True)
+        student._execute_loaded_netlist = lambda source_label="": setattr(student, "simulated", source_label)
+        return student
+
+    def test_edit_updates_netlist_preserves_extra_fields_and_resimulates(self):
+        student = self.make_student()
+        with patch.object(app.simpledialog, "askstring", return_value=" 2.2k extra "):
+            app.StudentView.edit_selected_component(student, 0)
+        self.assertEqual(student._StudentView__parsed_components[0]["value"], "2.2k")
+        self.assertEqual(student._StudentView__current_netlist_lines[1], "R1 in 0 2.2k temp=25")
+        self.assertTrue(student.refreshed)
+        self.assertIn("modificado", student.simulated)
+
+    def test_cancelled_edit_leaves_component_unchanged(self):
+        student = self.make_student()
+        with patch.object(app.simpledialog, "askstring", return_value=None):
+            app.StudentView.edit_selected_component(student, 0)
+        self.assertEqual(student._StudentView__parsed_components[0]["value"], "1k")
+        self.assertEqual(student._StudentView__current_netlist_lines[1], "R1 in 0 1k temp=25")
+
+    def test_reset_clears_modified_netlist_then_reloads(self):
+        student = self.make_student()
+        called = []
+        student.run_simulation = lambda: called.append(True)
+        app.StudentView.reset_original_netlist(student)
+        self.assertIsNone(student._StudentView__current_cir_path)
+        self.assertEqual(student._StudentView__current_netlist_lines, [])
+        self.assertEqual(called, [True])
+
+
+class FakeEntryValue:
+    def __init__(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+
+class FakeButtonState:
+    def __init__(self):
+        self.state = "normal"
+        self.text = "Registrarse"
+
+    def configure(self, **kwargs):
+        self.state = kwargs.get("state", self.state)
+        self.text = kwargs.get("text", self.text)
+
+    def winfo_exists(self):
+        return True
+
+
+class TestRegistration(unittest.TestCase):
+    def make_context(self, name="Ana Pérez", user_id="123", role="Profesor", password="clave"):
+        calls = {}
+        context = types.SimpleNamespace(
+            reg_name=FakeEntryValue(name),
+            reg_id=FakeEntryValue(user_id),
+            reg_role=FakeEntryValue(role),
+            reg_password=FakeEntryValue(password),
+            reg_btn=FakeButtonState(),
+            _run_async=lambda task, done, error: calls.update(task=task, done=done, error=error),
+            show_login=lambda: calls.update(show_login=True),
+        )
+        return context, calls
+
+    def test_register_rejects_missing_fields(self):
+        context, calls = self.make_context(name="")
+        with patch.object(app.messagebox, "showwarning") as warning:
+            app.VirtualLab.register(context)
+        warning.assert_called_once()
+        self.assertNotIn("task", calls)
+
+    def test_register_rejects_non_numeric_id(self):
+        context, calls = self.make_context(user_id="12a")
+        with patch.object(app.messagebox, "showwarning") as warning:
+            app.VirtualLab.register(context)
+        warning.assert_called_once_with("ID inválido", unittest.mock.ANY)
+        self.assertNotIn("task", calls)
+
+    def test_register_translates_professor_role_and_trims_fields(self):
+        context, calls = self.make_context(name=" Ana Pérez ", user_id="00123", password=" clave ")
+        sent = []
+        with patch.object(app, "client", types.SimpleNamespace(
+                registerUser=lambda *args: sent.append(args) or "created")), patch.object(app, "URL", "http://lab"):
+            app.VirtualLab.register(context)
+            result = calls["task"]()
+        self.assertEqual(result, "created")
+        self.assertEqual(sent, [("http://lab", "Ana Pérez", 123, "professor", " clave ")])
+        self.assertEqual(context.reg_btn.state, "disabled")
+        self.assertEqual(context.reg_btn.text, "Registrando...")
+
+    def test_successful_registration_restores_button_and_returns_to_login(self):
+        context, calls = self.make_context()
+        with patch.object(app.messagebox, "showinfo") as showinfo:
+            app.VirtualLab.register(context)
+            calls["done"]("created")
+        self.assertEqual(context.reg_btn.state, "normal")
+        self.assertEqual(context.reg_btn.text, "Registrarse")
+        self.assertTrue(calls.get("show_login"))
+        showinfo.assert_called_once()
+
+    def test_duplicate_registration_shows_warning_and_stays_on_form(self):
+        context, calls = self.make_context()
+        with patch.object(app.messagebox, "showwarning") as warning:
+            app.VirtualLab.register(context)
+            calls["done"]("already registered")
+        warning.assert_called_once()
+        self.assertNotIn("show_login", calls)
+
+    def test_server_error_shows_error_and_stays_on_form(self):
+        context, calls = self.make_context()
+        with patch.object(app.messagebox, "showerror") as showerror:
+            app.VirtualLab.register(context)
+            calls["done"]("error: unavailable")
+        showerror.assert_called_once()
+        self.assertNotIn("show_login", calls)
+
+    def test_async_registration_error_restores_button(self):
+        context, calls = self.make_context()
+        with patch.object(app.messagebox, "showerror") as showerror:
+            app.VirtualLab.register(context)
+            calls["error"](RuntimeError("sin conexión"))
+        self.assertEqual(context.reg_btn.state, "normal")
+        self.assertEqual(context.reg_btn.text, "Registrarse")
+        showerror.assert_called_once_with("Error de registro", "sin conexión")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
